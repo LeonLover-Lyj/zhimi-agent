@@ -1,0 +1,333 @@
+# ==========================================
+#  知觅 Agent – Cursor 零人工构建技术文档
+#  最终修正版：真实文档 + 混合检索（FAISS + BM25）
+# ==========================================
+
+PROJECT_NAME:        "知觅-Agent"
+REPO_DIR:            "zhimi-agent"
+PYTHON_VERSION:      "3.10"
+VENV_NAME:           "zhimi-agent"
+MIN_GPU_MEM_GB:      0
+TARGET_OS:           "linux / mac / win / wsl"
+
+# ============= 全局规则（Cursor 强约束） =====================
+RULES:
+  - 所有 Python 命令必须在 zhimi-agent 虚拟环境中执行
+  - 不允许使用系统全局 Python
+  - 不依赖 poetry / conda
+  - 如发现缺失文件，必须自动补齐
+  - 如本地知识库未构建，工具必须返回可解释提示，而不是抛异常
+  - Agent 不得在无必要时调用搜索工具
+
+# ============= 核心能力 =====================
+REQUIREMENTS:
+  - [x] 多轮对话（最近 3 轮上下文）
+  - [x] 本地文档问答（txt / md / pdf）
+  - [x] FAISS + BM25 混合检索
+  - [x] Agent 自动判断是否搜索
+  - [x] 防御式启动（无索引可运行）
+  - [x] 一键启动 & 验收
+
+# ============= 技术选型 =====================
+LLM_PROVIDER:        "qwen"
+LLM_MODEL:           "qwen-max"
+EMBEDDING_MODEL:     "BAAI/bge-large-zh-v1.5"
+VECTOR_DB:           "FAISS + BM25"
+MEMORY_TYPE:         "ConversationBufferWindowMemory(k=3)"
+AGENT_FRAMEWORK:     "LangChain 0.1.0"
+WEB_UI:              "Streamlit 1.29"
+
+# ============= 目录结构 =====================
+DIRECTORY_TREE: |
+  zhimi-agent/
+  ├── .cursorrules
+  ├── .env.example
+  ├── requirements.txt
+  ├── scripts/
+  │   └── index_local_docs.py
+  ├── zhimi/
+  │   ├── agent.py
+  │   ├── llm.py
+  │   ├── tools/
+  │   │   └── search_tool.py
+  │   ├── prompts/
+  │   │   └── react_cn.txt
+  │   └── ui/
+  │       └── streamlit_app.py
+  ├── data/
+  │   └── sample/
+  │       └── zhimi_readme.txt
+  ├── memory/
+  │   └── faiss_index/
+  ├── zhimi-agent/        # Python venv
+  ├── run.sh
+  └── run.bat
+
+# ============= Step 清单 ====================
+
+STEP_001:
+  name: "创建目录结构"
+  cmd: |
+    mkdir -p zhimi/{tools,prompts,ui} \
+             scripts \
+             data/sample \
+             memory/faiss_index
+
+STEP_002:
+  name: "写入 requirements.txt"
+  file: "requirements.txt"
+  content: |
+    langchain==0.1.0
+    langchain-openai==0.1.0
+    faiss-cpu==1.7.4
+    streamlit==1.29.0
+    python-dotenv==1.0.1
+    sentence-transformers==2.2.2
+    unstructured==0.12.0
+    pdfplumber==0.10.3
+    rank-bm25==0.2.2
+
+STEP_003:
+  name: "在 zhimi-agent 虚拟环境中安装依赖"
+  cmd: |
+    set -e
+
+    echo "📦 假设当前已处于 zhimi-agent 虚拟环境"
+    python --version
+    pip --version
+
+    pip install --upgrade pip
+    pip install -r requirements.txt
+
+    echo "✅ 依赖安装完成"
+
+
+STEP_004:
+  name: "写入 .env.example"
+  file: ".env.example"
+  content: |
+    DASHSCOPE_API_KEY=your_dashscope_api_key
+    LLM_MODEL=qwen-max
+
+STEP_005:
+  name: "写入示例文档"
+  cmd: |
+    echo "知觅（Zhimi）是一个基于通义千问的本地知识问答 Agent。" > data/sample/zhimi_readme.txt
+
+STEP_006:
+  name: "构建本地知识库索引脚本"
+  file: "scripts/index_local_docs.py"
+  content: |
+    import argparse
+    from pathlib import Path
+    from langchain.document_loaders import TextLoader, PyPDFLoader, UnstructuredMarkdownLoader
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain.embeddings import HuggingFaceBgeEmbeddings
+    from langchain.vectorstores import FAISS
+
+    INDEX_PATH = "memory/faiss_index"
+    EMBED_MODEL = "BAAI/bge-large-zh-v1.5"
+
+    def load_docs(data_dir: Path):
+        docs = []
+        for p in data_dir.rglob("*"):
+            if p.suffix == ".txt":
+                docs += TextLoader(str(p), encoding="utf-8").load()
+            elif p.suffix == ".pdf":
+                docs += PyPDFLoader(str(p)).load()
+            elif p.suffix in [".md", ".markdown"]:
+                docs += UnstructuredMarkdownLoader(str(p)).load()
+        return docs
+
+    def main(data_dir: str):
+        raw_docs = load_docs(Path(data_dir))
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", "。", "！", "？"]
+        )
+        docs = splitter.split_documents(raw_docs)
+
+        embeddings = HuggingFaceBgeEmbeddings(
+            model_name=EMBED_MODEL,
+            encode_kwargs={"normalize_embeddings": True}
+        )
+
+        vs = FAISS.from_documents(docs, embeddings)
+        vs.save_local(INDEX_PATH)
+        print(f"✅ 构建完成，文档片段数：{len(docs)}")
+
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--dir", required=True)
+        args = parser.parse_args()
+        main(args.dir)
+
+STEP_007:
+  name: "生成混合检索工具（防御式）"
+  file: "zhimi/tools/search_tool.py"
+  content: |
+    from pathlib import Path
+    from langchain.tools import Tool
+    from langchain.vectorstores import FAISS
+    from langchain.embeddings import HuggingFaceBgeEmbeddings
+    from langchain.retrievers import BM25Retriever
+    from pydantic import BaseModel, Field
+
+    INDEX_PATH = "memory/faiss_index"
+    EMBED_MODEL = "BAAI/bge-large-zh-v1.5"
+
+    embeddings = HuggingFaceBgeEmbeddings(
+        model_name=EMBED_MODEL,
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+    def load_retrievers():
+        if not Path(INDEX_PATH).exists():
+            return None, None
+        faiss = FAISS.load_local(
+            INDEX_PATH,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        bm25 = BM25Retriever.from_documents(list(faiss.docstore._dict.values()))
+        bm25.k = 2
+        return faiss, bm25
+
+    faiss, bm25 = load_retrievers()
+
+    def hybrid_search(query: str) -> str:
+        if faiss is None or bm25 is None:
+            return "⚠️ 本地知识库尚未构建，请先构建索引。"
+        docs = faiss.similarity_search(query, k=2) + bm25.get_relevant_documents(query)
+        uniq = {d.page_content: d for d in docs}
+        return "\n".join(uniq.keys()) or "未找到相关本地信息。"
+
+    class SearchInput(BaseModel):
+        query: str = Field(description="用户问题")
+
+    def build_search_tool():
+        return Tool.from_function(
+            func=hybrid_search,
+            name="search_local_knowledge",
+            description="仅当问题涉及本地文档或项目细节时使用",
+            args_schema=SearchInput,
+        )
+
+STEP_008:
+  name: "生成中文 ReAct Prompt"
+  file: "zhimi/prompts/react_cn.txt"
+  content: |
+    你是「知觅」，一个可以使用工具的中文智能助手。
+    如果问题是常识性或闲聊问题，不要调用任何工具。
+    仅当问题涉及本地文档、项目说明、实现细节时才调用工具。
+
+    可用工具：
+    {{tools}}
+
+    使用格式：
+    问题:
+    思考:
+    行动:
+    行动输入:
+    观察:
+    最终答案:
+
+    当前对话历史：
+    {{chat_history}}
+
+    问题: {{input}}
+    思考:
+
+STEP_009:
+  name: "生成 LLM 封装"
+  file: "zhimi/llm.py"
+  content: |
+    import os
+    from dotenv import load_dotenv
+    from langchain_openai import ChatOpenAI
+
+    load_dotenv()
+
+    def get_llm():
+        return ChatOpenAI(
+            model=os.getenv("LLM_MODEL", "qwen-max"),
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            temperature=0.2,
+        )
+
+STEP_010:
+  name: "生成 Agent"
+  file: "zhimi/agent.py"
+  content: |
+    from langchain.agents import create_react_agent, AgentExecutor
+    from langchain.memory import ConversationBufferWindowMemory
+    from langchain.prompts import PromptTemplate
+    from zhimi.llm import get_llm
+    from zhimi.tools.search_tool import build_search_tool
+
+    def load_agent():
+        llm = get_llm()
+        tools = [build_search_tool()]
+        memory = ConversationBufferWindowMemory(
+            k=3,
+            memory_key="chat_history",
+            return_messages=True
+        )
+
+        with open("zhimi/prompts/react_cn.txt", encoding="utf-8") as f:
+            prompt = PromptTemplate.from_template(f.read())
+
+        agent = create_react_agent(llm, tools, prompt)
+        return AgentExecutor(agent=agent, tools=tools, memory=memory, verbose=True)
+
+STEP_011:
+  name: "生成 Streamlit UI"
+  file: "zhimi/ui/streamlit_app.py"
+  content: |
+    import streamlit as st
+    from zhimi.agent import load_agent
+
+    st.set_page_config(page_title="知觅 Agent")
+    st.title("🌿 知觅 – 本地知识问答")
+
+    agent = load_agent()
+
+    if prompt := st.chat_input("请输入问题"):
+        with st.spinner("思考中..."):
+            res = agent.invoke({"input": prompt})
+            st.chat_message("assistant").write(res["output"])
+
+STEP_012:
+  name: "启动脚本 run.sh"
+  file: "run.sh"
+  mode: "0755"
+  content: |
+    #!/usr/bin/env bash
+    set -e
+    VENV_NAME=zhimi-agent
+
+    if [ ! -d "$VENV_NAME" ]; then
+      echo "❌ 未找到虚拟环境，请先执行 STEP_003"
+      exit 1
+    fi
+
+    source $VENV_NAME/bin/activate
+
+    if [ ! -d memory/faiss_index ]; then
+      python scripts/index_local_docs.py --dir data
+    fi
+
+    streamlit run zhimi/ui/streamlit_app.py
+
+# ============= 验收 =========================
+VERIFY_SCRIPT: |
+  source zhimi-agent/bin/activate
+  python - << 'EOF'
+  from zhimi.agent import load_agent
+  agent = load_agent()
+  res = agent.invoke({"input": "知觅是什么？"})
+  assert "知觅" in res["output"]
+  print("✅ 验收通过")
+  EOF
