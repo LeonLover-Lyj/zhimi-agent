@@ -21,7 +21,7 @@
 3. **添加远程仓库并推送**：
    ```bash
    # 替换 YOUR_USERNAME 为你的GitHub用户名
-   git remote add origin https://github.com/YOUR_USERNAME/zhimi-agent.git
+   git remote add origin https://github.com/LeonLover-Lyj/zhimi-agent.git
    git branch -M main
    git push -u origin main
    ```
